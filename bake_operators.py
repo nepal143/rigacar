@@ -24,6 +24,13 @@ import math
 import itertools
 import re
 
+# Version detection for API compatibility
+BLENDER_VERSION = bpy.app.version
+HAS_ACTION_SLOTS = BLENDER_VERSION >= (4, 4, 0)  # Action slots introduced in 4.4
+
+import bpy_extras.anim_utils
+HAS_BAKE_OPTIONS = hasattr(bpy_extras.anim_utils, 'BakeOptions')  # BakeOptions introduced in ~4.2
+
 
 def cursor(cursor_mode):
     def cursor_decorator(func):
@@ -73,20 +80,77 @@ def find_wheelbrake_bone(bones, position, side, index):
     return bones.get(backward_compatible_bone_name)
 
 
+def _get_fcurves_from_action(action, context_object=None):
+    """Get fcurves collection from an action, version-compatible."""
+    if HAS_ACTION_SLOTS:
+        # Blender 4.4+/5.0: Access fcurves through channelbag
+        if len(action.slots) == 0:
+            return None
+        # Try to get the slot for the specific object, fallback to first slot
+        action_slot = None
+        if context_object and context_object.animation_data:
+            action_slot = context_object.animation_data.action_slot
+        if action_slot is None and len(action.slots) > 0:
+            action_slot = action.slots[0]
+        if action_slot and len(action.layers) > 0 and len(action.layers[0].strips) > 0:
+            channelbag = action.layers[0].strips[0].channelbag(action_slot)
+            if channelbag:
+                return channelbag.fcurves
+        return None
+    else:
+        # Blender 4.0–4.3: Access fcurves directly from action
+        return action.fcurves
+
+
 def clear_property_animation(context, property_name, remove_keyframes=True):
     if remove_keyframes and context.object.animation_data and context.object.animation_data.action:
         fcurve_datapath = '["%s"]' % property_name
         action = context.object.animation_data.action
-        fcurve = action.fcurves.find(fcurve_datapath)
-        if fcurve is not None:
-            action.fcurves.remove(fcurve)
+
+        if HAS_ACTION_SLOTS:
+            # Blender 4.4+/5.0: Access fcurves through channelbag
+            action_slot = context.object.animation_data.action_slot
+            if action_slot and len(action.layers) > 0 and len(action.layers[0].strips) > 0:
+                channelbag = action.layers[0].strips[0].channelbag(action_slot)
+                if channelbag:
+                    fcurve = channelbag.fcurves.find(fcurve_datapath)
+                    if fcurve is not None:
+                        channelbag.fcurves.remove(fcurve)
+        else:
+            # Blender 4.0–4.3: Access fcurves directly from action
+            fcurve = action.fcurves.find(fcurve_datapath)
+            if fcurve is not None:
+                action.fcurves.remove(fcurve)
     context.object[property_name] = .0
 
 
 def create_property_animation(context, property_name):
     action = context.object.animation_data.action
     fcurve_datapath = '["%s"]' % property_name
-    return action.fcurves.new(fcurve_datapath, index=0, action_group='Wheels rotation')
+
+    if HAS_ACTION_SLOTS:
+        # Blender 4.4+/5.0: Create fcurves through channelbag
+        action_slot = context.object.animation_data.action_slot
+        if not action_slot:
+            return None
+
+        # Ensure layer and strip exist
+        if len(action.layers) == 0:
+            layer = action.layers.new("Layer")
+        else:
+            layer = action.layers[0]
+
+        if len(layer.strips) == 0:
+            strip = layer.strips.new(type='KEYFRAME')
+        else:
+            strip = layer.strips[0]
+
+        channelbag = strip.channelbag(action_slot, ensure=True)
+        fcurve = channelbag.fcurves.new(fcurve_datapath, index=0, group_name='Wheels rotation')
+        return fcurve
+    else:
+        # Blender 4.0–4.3: Create fcurves directly on action
+        return action.fcurves.new(fcurve_datapath, index=0, action_group='Wheels rotation')
 
 
 class FCurvesEvaluator(object):
@@ -150,14 +214,26 @@ class BakingOperator(object):
     @classmethod
     def poll(cls, context):
         return ('Car Rig' in context.object.data and
-                context.object.data['Car Rig'] and
+                context.object.data.get('Car Rig', False) and
                 context.object.mode in ('POSE', 'OBJECT'))
 
     def invoke(self, context, event):
         if context.object.animation_data is None:
             context.object.animation_data_create()
         if context.object.animation_data.action is None:
-            context.object.animation_data.action = bpy.data.actions.new("%sAction" % context.object.name)
+            action = bpy.data.actions.new("%sAction" % context.object.name)
+            context.object.animation_data.action = action
+
+            if HAS_ACTION_SLOTS:
+                # Blender 4.4+/5.0: Ensure action slot is assigned
+                if len(action.slots) == 0:
+                    action.slots.new(id_type='OBJECT', name=context.object.name)
+
+                # Auto-assign the first compatible slot
+                if context.object.animation_data.action_slot is None:
+                    suitable_slots = context.object.animation_data.action_suitable_slots
+                    if suitable_slots:
+                        context.object.animation_data.action_slot = suitable_slots[0]
 
         action = context.object.animation_data.action
         self.frame_start = int(action.frame_range[0])
@@ -174,22 +250,38 @@ class BakingOperator(object):
 
     def _create_euler_evaluator(self, action, source_bone):
         fcurve_name = 'pose.bones["%s"].rotation_euler' % source_bone.name
-        fc_root_rot = [action.fcurves.find(fcurve_name, index=i) for i in range(3)]
+        fcurves = _get_fcurves_from_action(action)
+        if fcurves:
+            fc_root_rot = [fcurves.find(fcurve_name, index=i) for i in range(3)]
+        else:
+            fc_root_rot = [None, None, None]
         return EulerToQuaternionFCurvesEvaluator(FCurvesEvaluator(fc_root_rot, default_value=(.0, .0, .0)))
 
     def _create_quaternion_evaluator(self, action, source_bone):
         fcurve_name = 'pose.bones["%s"].rotation_quaternion' % source_bone.name
-        fc_root_rot = [action.fcurves.find(fcurve_name, index=i) for i in range(4)]
+        fcurves = _get_fcurves_from_action(action)
+        if fcurves:
+            fc_root_rot = [fcurves.find(fcurve_name, index=i) for i in range(4)]
+        else:
+            fc_root_rot = [None, None, None, None]
         return QuaternionFCurvesEvaluator(FCurvesEvaluator(fc_root_rot, default_value=(1.0, .0, .0, .0)))
 
     def _create_location_evaluator(self, action, source_bone):
         fcurve_name = 'pose.bones["%s"].location' % source_bone.name
-        fc_root_loc = [action.fcurves.find(fcurve_name, index=i) for i in range(3)]
+        fcurves = _get_fcurves_from_action(action)
+        if fcurves:
+            fc_root_loc = [fcurves.find(fcurve_name, index=i) for i in range(3)]
+        else:
+            fc_root_loc = [None, None, None]
         return VectorFCurvesEvaluator(FCurvesEvaluator(fc_root_loc, default_value=(.0, .0, .0)))
 
     def _create_scale_evaluator(self, action, source_bone):
         fcurve_name = 'pose.bones["%s"].scale' % source_bone.name
-        fc_root_loc = [action.fcurves.find(fcurve_name, index=i) for i in range(3)]
+        fcurves = _get_fcurves_from_action(action)
+        if fcurves:
+            fc_root_loc = [fcurves.find(fcurve_name, index=i) for i in range(3)]
+        else:
+            fc_root_loc = [None, None, None]
         return VectorFCurvesEvaluator(FCurvesEvaluator(fc_root_loc, default_value=(1.0, 1.0, 1.0)))
 
     def _bake_action(self, context, *source_bones):
@@ -197,6 +289,7 @@ class BakingOperator(object):
         nla_tweak_mode = context.object.animation_data.use_tweak_mode if hasattr(context.object.animation_data, 'use_tweak_mode') else False
 
         # saving context
+        # Use data.bones for selection (works on all Blender versions)
         selected_bones = [b for b in context.object.data.bones if b.select]
         mode = context.object.mode
         for b in selected_bones:
@@ -208,14 +301,34 @@ class BakingOperator(object):
             source_bones_matrix_basis.append(context.object.pose.bones[source_bone.name].matrix_basis.copy())
             source_bone.select = True
 
-        # Blender 2.81 : Another hack for another bug in the bake operator
-        # removing from the selection objects which are not the current one
+        # Hack: removing from the selection objects which are not the current one
         for obj in context.selected_objects:
             if obj is not context.object:
                 obj.select_set(state=False)
 
-        bpy.ops.nla.bake(frame_start=self.frame_start, frame_end=self.frame_end, only_selected=True, bake_types={'POSE'}, visual_keying=True)
-        baked_action = context.object.animation_data.action
+        if HAS_BAKE_OPTIONS:
+            # Blender 4.2+: Use bpy_extras.anim_utils.bake_action with BakeOptions
+            baked_action = bpy_extras.anim_utils.bake_action(
+                context.object,
+                action=None,
+                frames=range(self.frame_start, self.frame_end + 1),
+                bake_options=bpy_extras.anim_utils.BakeOptions(
+                    only_selected=True, do_pose=True, do_object=False,
+                    do_visual_keying=True, do_constraint_clear=False,
+                    do_parents_clear=False, do_clean=False,
+                    do_location=True, do_rotation=True, do_scale=True,
+                    do_bbone=True, do_custom_props=True),
+            )
+        else:
+            # Blender 4.0–4.1: Use bpy_extras.anim_utils.bake_action with keyword args
+            baked_action = bpy_extras.anim_utils.bake_action(
+                context.object,
+                action=None,
+                frames=range(self.frame_start, self.frame_end + 1),
+                only_selected=True, do_pose=True, do_object=False,
+                do_visual_keying=True, do_constraint_clear=False,
+                do_parents_clear=False, do_clean=False,
+            )
 
         # restoring context
         for source_bone, matrix_basis in zip(source_bones, source_bones_matrix_basis):

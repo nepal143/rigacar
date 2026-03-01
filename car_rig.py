@@ -87,13 +87,32 @@ def create_translation_x_driver(ob, bone, driver_data_path):
     targ.data_path = driver_data_path
 
 
+# Color palette mapping from old THEME color sets to Blender 4.0 palette types
+_THEME_TO_PALETTE = {
+    'THEME01': 'THEME01', 'THEME02': 'THEME02', 'THEME03': 'THEME03',
+    'THEME04': 'THEME04', 'THEME05': 'THEME05', 'THEME06': 'THEME06',
+    'THEME07': 'THEME07', 'THEME08': 'THEME08', 'THEME09': 'THEME09',
+    'THEME10': 'THEME10', 'THEME11': 'THEME11', 'THEME12': 'THEME12',
+    'THEME13': 'THEME13', 'THEME14': 'THEME14', 'THEME15': 'THEME15',
+    'THEME16': 'THEME16', 'THEME17': 'THEME17', 'THEME18': 'THEME18',
+    'THEME19': 'THEME19', 'THEME20': 'THEME20',
+}
+
+
 def create_bone_group(pose, group_name, color_set, bone_names):
-    group = pose.bone_groups.new(name=group_name)
-    group.color_set = color_set
+    # Blender 4.0+: Use Bone Collections instead of Bone Groups
+    armature = pose.id_data.data
+    # Create or get a bone collection
+    bcoll = armature.collections.get(group_name)
+    if bcoll is None:
+        bcoll = armature.collections.new(group_name)
     for bone_name in bone_names:
-        bone = pose.bones.get(bone_name)
+        bone = armature.bones.get(bone_name)
         if bone is not None:
-            bone.bone_group = group
+            bcoll.assign(bone)
+            # Set the bone color using the palette
+            if color_set in _THEME_TO_PALETTE:
+                bone.color.palette = _THEME_TO_PALETTE[color_set]
 
 
 def name_range(prefix, nb=1000):
@@ -117,34 +136,49 @@ def define_custom_property(target, name, value, description=None, overridable=Tr
 
 
 def dispatch_bones_to_armature_layers(ob):
+    # Blender 4.0+: Use Bone Collections instead of layer arrays
     re_mch_bone = re.compile(r'^MCH-Wheel(Brake)?\.(Ft|Bk)\.[LR](\.\d+)?$')
-    default_visible_layers = [False] * 32
+    amt = ob.data
 
-    for b in ob.data.bones:
-        layers = [False] * 32
+    # Create collections for the different bone categories
+    def get_or_create_collection(name, visible=False):
+        bcoll = amt.collections.get(name)
+        if bcoll is None:
+            bcoll = amt.collections.new(name)
+        bcoll.is_visible = visible
+        return bcoll
+
+    def_coll = get_or_create_collection('DEF Bones', visible=False)
+    mch_coll = get_or_create_collection('MCH Bones', visible=False)
+    mch_ext_coll = get_or_create_collection('MCH Extension', visible=False)
+    shape_coll = get_or_create_collection('Custom Shapes', visible=False)
+
+    # Helper to move a bone exclusively to a target collection
+    # (remove from all other collections so it's only in the target)
+    def assign_exclusively(bone, target_collection):
+        target_collection.assign(bone)
+        for coll in list(amt.collections):
+            if coll != target_collection and coll.find(bone.name):
+                coll.unassign(bone)
+
+    for b in amt.bones:
         if b.name.startswith('DEF-'):
-            layers[DEF_BONE_LAYER] = True
+            assign_exclusively(b, def_coll)
         elif b.name.startswith('MCH-'):
-            layers[MCH_BONE_LAYER] = True
+            assign_exclusively(b, mch_coll)
             if b.name in ('MCH-Body', 'MCH-Steering') or re_mch_bone.match(b.name):
-                layers[MCH_BONE_EXTENSION_LAYER] = True
-        else:
-            layer_num = ob.pose.bones[b.name].bone_group_index
-            layers[layer_num] = True
-            default_visible_layers[layer_num] = True
-        b.layers = layers
+                mch_ext_coll.assign(b)
+        elif b.name.startswith('SHP-'):
+            assign_exclusively(b, shape_coll)
 
-    ob.data.layers = default_visible_layers
-
-    shape_bone_layers = [False] * 32
-    shape_bone_layers[CUSTOM_SHAPE_LAYER] = True
+    # Handle custom shape bones — copy shape to transform bone and hide it
     for b in ob.pose.bones:
         if b.custom_shape:
             if b.custom_shape_transform:
                 ob.pose.bones[b.custom_shape_transform.name].custom_shape = b.custom_shape
-                ob.data.bones[b.custom_shape_transform.name].layers = shape_bone_layers
+                assign_exclusively(amt.bones[b.custom_shape_transform.name], shape_coll)
             else:
-                ob.data.bones[b.name].layers[CUSTOM_SHAPE_LAYER] = True
+                shape_coll.assign(amt.bones[b.name])
 
 
 class NameSuffix(object):
@@ -435,8 +469,14 @@ def generate_constraint_on_wheel_brake_bone(wheel_brake_pose_bone, wheel_pose_bo
     wheel_brake_pose_bone.lock_scale = (True, False, False)
     wheel_brake_pose_bone.custom_shape = get_widget('WGT-CarRig.WheelBrake')
     wheel_brake_pose_bone.bone.show_wire = True
-    wheel_brake_pose_bone.bone_group = wheel_pose_bone.bone_group
-    wheel_brake_pose_bone.bone.layers = wheel_pose_bone.bone.layers
+    # Blender 4.0+: Copy bone collection assignments and color instead of bone_group/layers
+    wheel_brake_bone = wheel_brake_pose_bone.bone
+    wheel_bone = wheel_pose_bone.bone
+    wheel_brake_bone.color.palette = wheel_bone.color.palette
+    # Assign wheel brake bone to the same collections as the wheel bone
+    for bcoll in wheel_brake_pose_bone.id_data.data.collections:
+        if bcoll.find(wheel_bone.name):
+            bcoll.assign(wheel_brake_bone)
 
     cns = wheel_brake_pose_bone.constraints.new('LIMIT_SCALE')
     cns.name = 'Brakes'
